@@ -54,10 +54,17 @@ from warnings import warn
 
 from wavenet_vocoder.util import is_mulaw_quantize, is_mulaw, is_raw, is_scalar_input
 from wavenet_vocoder.mixture import discretized_mix_logistic_loss
-from wavenet_vocoder.mixture import sample_from_discretized_mix_logistic
+from wavenet_vocoder.mixture import sample_from_discretized_mix_logistic, sample_from_gaussian
 
 import audio
 from hparams import hparams, hparams_debug_string
+import infolog
+
+log_dir = "log_wavenet_single"
+run_name = "wavenet_single_gaussian"
+os.makedirs(log_dir, exist_ok=True)
+infolog.init(os.path.join(log_dir, 'Terminal_train_log'), run_name)
+log = infolog.log
 
 global_step = 0
 global_test_step = 0
@@ -125,7 +132,7 @@ class _NPYDataSource(FileDataSource):
         with open(meta, "rb") as f:
             lines = f.readlines()
         l = lines[0].decode("utf-8").split("|")
-        assert len(l) == 4 or len(l) == 5
+        # assert len(l) == 4 or len(l) == 5
         self.multi_speaker = len(l) == 5
         self.lengths = list(
             map(lambda l: int(l.decode("utf-8").split("|")[2]), lines))
@@ -313,6 +320,35 @@ class MaskedCrossEntropyLoss(nn.Module):
         return ((losses * mask_).sum()) / mask_.sum()
 
 
+class MaskedMLELoss(nn.Module):
+    def __init__(self, log_scale_min):
+        super(MaskedMLELoss, self).__init__()
+        self.log_scale_min = log_scale_min
+
+    def forward(self, input, target, lengths=None, mask=None, max_len=None):
+        input = input.transpose(1, 2)             # B x T x C
+        target = torch.squeeze(target, dim=-1)
+        if lengths is None and mask is None:
+            raise RuntimeError("Should provide either lengths or mask")
+
+        # (B, T, 1)
+        if mask is None:
+            mask = sequence_mask(lengths, max_len).unsqueeze(-1)
+
+        # (B, T, 1)
+        mask_= torch.squeeze(mask, dim=-1)
+
+        loc, log_scale = input[:, :, 0], input[:, :, 1]
+        log_scale = torch.clamp(log_scale, min=self.log_scale_min)
+
+        dist = torch.distributions.normal.Normal(loc=loc, scale=torch.exp(log_scale))
+        log_prob = dist.log_prob(target)
+        losses = -1.0 * log_prob
+        assert losses.size() == target.size()
+
+        return ((losses * mask_).sum()) / mask_.sum()
+
+
 class DiscretizedMixturelogisticLoss(nn.Module):
     def __init__(self):
         super(DiscretizedMixturelogisticLoss, self).__init__()
@@ -477,7 +513,7 @@ def save_waveplot(path, y_hat, y_target):
     plt.close()
 
 
-def eval_model(global_step, writer, device, model, y, c, g, input_lengths, eval_dir, ema=None):
+def eval_model(global_step, writer, device, model, y, c, g, input_lengths, loss_type, eval_dir, ema=None):
     if ema is not None:
         print("Using averaged model for evaluation")
         model = clone_as_averaged_model(device, model, ema)
@@ -524,7 +560,7 @@ def eval_model(global_step, writer, device, model, y, c, g, input_lengths, eval_
     # Run the model in fast eval mode
     with torch.no_grad():
         y_hat = model.incremental_forward(
-            initial_input, c=c, g=g, T=length, softmax=True, quantize=True, tqdm=tqdm,
+            initial_input, c=c, g=g, T=length, loss_type="single_gaussian", softmax=True, quantize=True, tqdm=tqdm,
             log_scale_min=hparams.log_scale_min)
 
     if is_mulaw_quantize(hparams.input_type):
@@ -549,7 +585,8 @@ def eval_model(global_step, writer, device, model, y, c, g, input_lengths, eval_
     save_waveplot(path, y_hat, y_target)
 
 
-def save_states(global_step, writer, y_hat, y, input_lengths, checkpoint_dir=None):
+def save_states(global_step, writer, y_hat, y, input_lengths,
+        checkpoint_dir=None, loss_type=None):
     print("Save intermediate states at step {}".format(global_step))
     idx = np.random.randint(0, len(y_hat))
     length = input_lengths[idx].data.cpu().item()
@@ -570,9 +607,11 @@ def save_states(global_step, writer, y_hat, y, input_lengths, checkpoint_dir=Non
         y = P.inv_mulaw_quantize(y, hparams.quantize_channels)
     else:
         # (B, T)
-        y_hat = sample_from_discretized_mix_logistic(
-            y_hat, log_scale_min=hparams.log_scale_min)
-        # (T,)
+        if loss_type == "single_gaussian":
+            y_hat = sample_from_gaussian(y_hat, log_scale_min=hparams.log_scale_min)
+        else:
+            y_hat = sample_from_discretized_mix_logistic(y_hat, log_scale_min=hparams.log_scale_min)
+            # (T,)
         y_hat = y_hat[idx].view(-1).data.cpu().numpy()
         y = y[idx].view(-1).data.cpu().numpy()
 
@@ -596,7 +635,7 @@ def save_states(global_step, writer, y_hat, y, input_lengths, checkpoint_dir=Non
 def __train_step(device, phase, epoch, global_step, global_test_step,
                  model, optimizer, writer, criterion,
                  x, y, c, g, input_lengths,
-                 checkpoint_dir, eval_dir=None, do_eval=False, ema=None):
+                 checkpoint_dir, loss_type, eval_dir=None, do_eval=False, ema=None):
     sanity_check(model, c, g)
 
     # x : (B, C, T)
@@ -615,9 +654,11 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
     # Learning rate schedule
     current_lr = hparams.initial_learning_rate
     if train and hparams.lr_schedule is not None:
-        lr_schedule_f = getattr(lrschedule, hparams.lr_schedule)
-        current_lr = lr_schedule_f(
-            hparams.initial_learning_rate, step, **hparams.lr_schedule_kwargs)
+        current_lr = hparams.initial_learning_rate * (0.5 ** (global_step //
+            200000))
+        #lr_schedule_f = getattr(lrschedule, hparams.lr_schedule)
+        #current_lr = lr_schedule_f(
+        #    hparams.initial_learning_rate, step, **hparams.lr_schedule_kwargs)
         for param_group in optimizer.param_groups:
             param_group['lr'] = current_lr
     optimizer.zero_grad()
@@ -652,12 +693,12 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
         loss = criterion(y_hat[:, :, :-1], y[:, 1:, :], mask=mask)
 
     if train and step > 0 and step % hparams.checkpoint_interval == 0:
-        save_states(step, writer, y_hat, y, input_lengths, checkpoint_dir)
+        save_states(step, writer, y_hat, y, input_lengths, checkpoint_dir, loss_type)
         save_checkpoint(device, model, optimizer, step, checkpoint_dir, epoch, ema)
 
     if do_eval:
         # NOTE: use train step (i.e., global_step) for filename
-        eval_model(global_step, writer, device, model, y, c, g, input_lengths, eval_dir, ema)
+        eval_model(global_step, writer, device, model, y, c, g, input_lengths, loss_type, eval_dir, ema)
 
     # Update
     if train:
@@ -671,6 +712,7 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
                 if name in ema.shadow:
                     ema.update(name, param.data)
 
+    log("step: {}\tloss:{:.9f}".format(step, float(loss.item())))
     # Logs
     writer.add_scalar("{} loss".format(phase), float(loss.item()), step)
     if train:
@@ -681,9 +723,12 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
     return loss.item()
 
 
-def train_loop(device, model, data_loaders, optimizer, writer, checkpoint_dir=None):
+def train_loop(device, model, data_loaders, optimizer, writer,
+        checkpoint_dir=None, log_scale_min=None, loss_type=None):
     if is_mulaw_quantize(hparams.input_type):
         criterion = MaskedCrossEntropyLoss()
+    elif loss_type == "single_gaussian":
+        criterion = MaskedMLELoss(log_scale_min)
     else:
         criterion = DiscretizedMixturelogisticLoss()
 
@@ -723,7 +768,7 @@ def train_loop(device, model, data_loaders, optimizer, writer, checkpoint_dir=No
                 running_loss += __train_step(device,
                                              phase, global_epoch, global_step, global_test_step, model,
                                              optimizer, writer, criterion, x, y, c, g, input_lengths,
-                                             checkpoint_dir, eval_dir, do_eval, ema)
+                                             checkpoint_dir, loss_type, eval_dir, do_eval, ema)
 
                 # update global state
                 if train:
@@ -916,8 +961,8 @@ if __name__ == "__main__":
     speaker_id = args["--speaker-id"]
     speaker_id = int(speaker_id) if speaker_id is not None else None
     preset = args["--preset"]
-
     data_root = args["--data-root"]
+
     if data_root is None:
         data_root = join(dirname(__file__), "data", "ljspeech")
 
@@ -950,10 +995,8 @@ if __name__ == "__main__":
         receptive_field, receptive_field / fs * 1000))
 
     optimizer = optim.Adam(model.parameters(),
-                           lr=hparams.initial_learning_rate, betas=(
-        hparams.adam_beta1, hparams.adam_beta2),
-        eps=hparams.adam_eps, weight_decay=hparams.weight_decay,
-        amsgrad=hparams.amsgrad)
+                           lr=hparams.initial_learning_rate, betas=(hparams.adam_beta1, hparams.adam_beta2),
+                           eps=hparams.adam_eps, weight_decay=hparams.weight_decay, amsgrad=hparams.amsgrad)
 
     if checkpoint_restore_parts is not None:
         restore_parts(checkpoint_restore_parts, model)
@@ -970,8 +1013,9 @@ if __name__ == "__main__":
 
     # Train!
     try:
-        train_loop(device, model, data_loaders, optimizer, writer,
-                   checkpoint_dir=checkpoint_dir)
+        train_loop(device, model, data_loaders, optimizer, writer, checkpoint_dir=checkpoint_dir,
+                   log_scale_min=hparams.log_scale_min, loss_type=hparams.loss_type)
+
     except KeyboardInterrupt:
         print("Interrupted!")
         pass

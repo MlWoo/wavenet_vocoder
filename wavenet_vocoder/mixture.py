@@ -151,3 +151,16 @@ def sample_from_discretized_mix_logistic(y, log_scale_min=-7.0):
     x = torch.clamp(torch.clamp(x, min=-1.), max=1.)
 
     return x
+
+
+def sample_from_gaussian(inputs, log_scale_min):
+    assert inputs.size(1) == 2
+    # B x T x C
+    inputs = inputs.transpose(1, 2)
+    loc, log_scale = inputs[:, :, 0], inputs[:, :, 1]
+    log_scale = torch.clamp(log_scale, min=log_scale_min)
+
+    dist = torch.distributions.normal.Normal(loc=loc, scale=torch.exp(log_scale))
+    inputs = dist.sample()
+    inputs = torch.clamp(inputs, min=-1.0, max=1.0)
+    return inputs

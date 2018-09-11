@@ -7,7 +7,7 @@ import numpy as np
 # Default hyperparameters:
 hparams = tf.contrib.training.HParams(
     name="wavenet_vocoder",
-
+    loss_type=None,
     # Convenient model builder
     builder="wavenet",
 

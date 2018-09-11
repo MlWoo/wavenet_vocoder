@@ -35,6 +35,17 @@ def ConvTranspose2d(in_channels, out_channels, kernel_size,
     else:
         return m
 
+def Conv1d2x1_(in_channels, out_channels, bias=True, weight_normalization=True):
+    """1-by-1 convolution layer
+    """
+    if weight_normalization:
+        assert bias
+        return Conv1d(in_channels, out_channels, kernel_size=2, padding=1,
+                      dilation=1, bias=bias, std_mul=1.0)
+    else:
+        return conv.Conv1d(in_channels, out_channels, kernel_size=2, padding=1,
+                           dilation=1, bias=bias)
+
 
 def Conv1d1x1(in_channels, out_channels, bias=True, weight_normalization=True):
     """1-by-1 convolution layer

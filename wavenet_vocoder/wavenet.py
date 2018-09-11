@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from .modules import Embedding
 
 from .modules import Conv1d1x1, ResidualConv1dGLU, ConvTranspose2d
-from .mixture import sample_from_discretized_mix_logistic
+from .mixture import sample_from_discretized_mix_logistic, sample_from_gaussian
 
 
 def _expand_global_features(B, T, g, bct=True):
@@ -98,10 +98,8 @@ class WaveNet(nn.Module):
     """
 
     def __init__(self, out_channels=256, layers=20, stacks=2,
-                 residual_channels=512,
-                 gate_channels=512,
-                 skip_out_channels=512,
-                 kernel_size=3, dropout=1 - 0.95,
+                 residual_channels=512, gate_channels=512, skip_out_channels=512, kernel_size=3,
+                 dropout=1 - 0.95, leaky_slope=0.4,
                  cin_channels=-1, gin_channels=-1, n_speakers=None,
                  weight_normalization=True,
                  upsample_conditional_features=False,
@@ -136,6 +134,7 @@ class WaveNet(nn.Module):
                 gin_channels=gin_channels,
                 weight_normalization=weight_normalization)
             self.conv_layers.append(conv)
+
         self.last_conv_layers = nn.ModuleList([
             nn.ReLU(inplace=True),
             Conv1d1x1(skip_out_channels, skip_out_channels,
@@ -164,7 +163,7 @@ class WaveNet(nn.Module):
                 self.upsample_conv.append(convt)
                 # assuming we use [0, 1] scaled features
                 # this should avoid non-negative upsampling output
-                self.upsample_conv.append(nn.ReLU(inplace=True))
+                self.upsample_conv.append(nn.LeakyReLU(negative_slope=leaky_slope, inplace=True))
         else:
             self.upsample_conv = None
 
@@ -218,6 +217,7 @@ class WaveNet(nn.Module):
 
         # Feed data to network
         x = self.first_conv(x)
+        #x = torch.tanh(x)
         skips = None
         for f in self.conv_layers:
             x, h = f(x, c, g_bct)
@@ -232,12 +232,13 @@ class WaveNet(nn.Module):
         for f in self.last_conv_layers:
             x = f(x)
 
+        assert not softmax
         x = F.softmax(x, dim=1) if softmax else x
 
         return x
 
     def incremental_forward(self, initial_input=None, c=None, g=None,
-                            T=100, test_inputs=None,
+                            T=100, test_inputs=None, loss_type=None,
                             tqdm=lambda x: x, softmax=True, quantize=True,
                             log_scale_min=-7.0):
         """Incremental forward step
@@ -349,7 +350,11 @@ class WaveNet(nn.Module):
 
             # Generate next input by sampling
             if self.scalar_input:
-                x = sample_from_discretized_mix_logistic(
+                if loss_type == "single_gaussian":
+                    # B X T X C
+                    x = sample_from_gaussian(x.view(B, -1, 1), log_scale_min=log_scale_min)
+                else:
+                    x = sample_from_discretized_mix_logistic(
                     x.view(B, -1, 1), log_scale_min=log_scale_min)
             else:
                 x = F.softmax(x.view(B, -1), dim=1) if softmax else x.view(B, -1)
