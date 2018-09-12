@@ -8,6 +8,11 @@ The goal of the repository is to provide an implementation of the WaveNet vocode
 
 Audio samples are available at https://r9y9.github.io/wavenet_vocoder/.
 
+## A single Gaussian distribution result
+
+The top one is trained at 150k step and the bottom one is target.  
+![](image/Selection_010.png)
+
 ## Online TTS demo
 
 A notebook supposed to be executed on https://colab.research.google.com is available:
